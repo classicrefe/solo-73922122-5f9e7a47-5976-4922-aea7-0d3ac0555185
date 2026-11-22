@@ -19,6 +19,16 @@ from flask import (
 from . import db, importer
 
 
+def _decode_csv(raw: bytes) -> str | None:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("gb18030")
+        except UnicodeDecodeError:
+            return None
+
+
 def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__)
     app.config.update(
@@ -79,14 +89,10 @@ def create_app(config: dict | None = None) -> Flask:
             flash("请选择 CSV 文件", "error")
             return redirect(url_for("index"))
         raw = upload_file.read()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                text = raw.decode("gb18030")
-            except UnicodeDecodeError:
-                flash("无法解码 CSV，请使用 UTF-8 或 GB18030", "error")
-                return redirect(url_for("index"))
+        text = _decode_csv(raw)
+        if text is None:
+            flash("无法解码 CSV，请使用 UTF-8 或 GB18030", "error")
+            return redirect(url_for("index"))
         parsed = importer.parse_csv(text)
         if parsed.errors:
             for message in parsed.errors[:20]:
@@ -118,9 +124,49 @@ def create_app(config: dict | None = None) -> Flask:
             if detail is None:
                 flash(f"没有网格 {grid_id} 的曝光记录", "error")
                 return redirect(url_for("index"))
-            return render_template("grid.html", grid=detail)
+            comparison = None
+            target = request.args.get("target", "").strip()
+            first = request.args.get("first", "").strip()
+            second = request.args.get("second", "").strip()
+            if target or first or second:
+                comparison = db.compare_colour(conn, grid_id, target, first, second)
+            return render_template(
+                "grid.html", grid=detail, comparison=comparison
+            )
         finally:
             conn.close()
+
+    @app.post("/grids/<grid_id>/photometry")
+    def upload_photometry(grid_id: str):
+        upload_file = request.files.get("csv")
+        if upload_file is None or not upload_file.filename:
+            flash("请选择测光 CSV 文件", "error")
+            return redirect(url_for("grid_page", grid_id=grid_id))
+        text = _decode_csv(upload_file.read())
+        if text is None:
+            flash("无法解码 CSV，请使用 UTF-8 或 GB18030", "error")
+            return redirect(url_for("grid_page", grid_id=grid_id))
+        parsed = importer.parse_photometry_csv(text)
+        if parsed.errors:
+            for message in parsed.errors[:20]:
+                flash(message, "error")
+            if len(parsed.errors) > 20:
+                flash(f"另有 {len(parsed.errors) - 20} 条错误未显示", "error")
+            return redirect(url_for("grid_page", grid_id=grid_id))
+        conn = db.open_db(app.config.get("DATABASE"))
+        try:
+            try:
+                outcome = db.import_photometry(conn, parsed.rows, upload_file.filename)
+            except db.PhotometryConflict as exc:
+                flash(f"测光导入被拒绝，已入库的星等未改动：{exc}", "error")
+                return redirect(url_for("grid_page", grid_id=grid_id))
+        finally:
+            conn.close()
+        flash(
+            f"测光导入完成：新增 {outcome['inserted']} 行，跳过同键同值 {outcome['skipped']} 行",
+            "success",
+        )
+        return redirect(url_for("grid_page", grid_id=grid_id))
 
     @app.post("/exposures/<int:exposure_id>/validity")
     def toggle(exposure_id: int):

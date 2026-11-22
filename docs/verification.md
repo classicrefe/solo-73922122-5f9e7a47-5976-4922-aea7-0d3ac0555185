@@ -1,14 +1,16 @@
 # Verification log
 
-Environment: Debian container, Python 3.11.2, SQLite 3.40.1, Flask 3.1.3,
-gunicorn 27.0.1. Docker is not installed in this container, so the Compose
-stack was reviewed statically and the same command line was exercised with
-gunicorn directly (see "Live server").
+Environment: Debian 12 container, Python 3.11.2, SQLite 3.40.1, Flask 3.1.3,
+gunicorn 23.0.0. Docker CLI/daemon and container runtime are **not** available
+in this sandbox (no `/var/run/docker.sock`, no privileges to start `dockerd`),
+so the Compose stack was validated structurally (YAML + configuration), and
+the same image command line was exercised with gunicorn directly (see
+"Live server"). The Compose launch itself remains unverified here.
 
 ## Automated tests
 
 ```
-python3 -m pytest -q     ->  27 passed
+python3 -m pytest -q     ->  63 passed
 ```
 
 Covered behaviours:
@@ -29,42 +31,78 @@ Covered behaviours:
 * HTTP: upload, error reporting, toggle redirect + coverage flash, CSRF
   rejection, JSON API, health endpoint.
 
-## Multi-grid invalidation run
+Photometry / comparison (this round, 36 new tests):
 
-`python3 scripts/verify_multi_grid_invalidation.py` on a temp DB loaded from
-`samples/survey_coverage.csv`:
+* parser rejects `nan`/`inf`/non-numeric magnitudes, non-positive or
+  non-integer photometry versions, missing columns and blank key fields;
+* first five columns are the key: same key + same value is stored once,
+  same key + different value is a row-level error;
+* exposure that does not exist or does not cover the grid rejects the whole
+  batch; a valid row before the bad one is rolled back too;
+* conflicting magnitude against stored data rejects the batch and leaves every
+  stored magnitude byte-identical;
+* comparison uses the exposures from the *current* `coverage` pair and the
+  highest common photometry version with all four magnitudes;
+* an incomplete newer version falls back to the last complete shared version;
+* no common version / unpaired night / same night / unknown night produce a
+  "暂不可比" reason instead of a number;
+* invalidating the g exposure of the pair switches to the alternate pair; the
+  comparison then becomes not-comparable, and importing photometry for the new
+  pair makes it comparable again (version choice re-run);
+* web page renders the comparison entry, upload form, exposures, version,
+  both g−r values and the signed delta.
+
+## End-to-end script
+
+`python3 scripts/verify_colour_comparison.py` on a temp DB loaded from
+`samples/survey_coverage.csv` + `samples/photometry*.csv`:
 
 ```
-exposure 2 E1002 (N2026-10-01) covers grids: G01, G02, G03
-before: {'G01': ('paired', 'E1003/E1004'), 'G02': ('paired', 'E1001/E1002'), 'G03': ('paired', 'E1001/E1002')}
-invalidate changed: True affected grids: ['G01', 'G02', 'G03']
-after : {'G01': ('paired', 300), 'G02': ('unpaired', None), 'G03': ('unpaired', None)}
-  G01: usable_nights=2 needs_more=False
-  G02: usable_nights=0 needs_more=True
-  G03: usable_nights=0 needs_more=True
-restored: {'G01': ('paired', 'E1003/E1004'), 'G02': ('paired', 'E1001/E1002'), 'G03': ('paired', 'E1001/E1002')}
+import v1+partial v2: {'inserted': 7, 'skipped': 0}
+[v2 未齐 -> 应回退 v1]  version=1  N1 g-r=0.5000  N2 g-r=0.6000  Δ=+0.1000
+import complete v2: {'inserted': 1, 'skipped': 3}
+[v2 已齐 -> 应用 v2]    version=2  N1 g-r=0.7000  N2 g-r=0.8500  Δ=+0.1500
+[换配对后 -> 应暂不可比] 找不到可用共同版号（四次曝光的星等不齐），暂不可比
+import v3 for new pair: {'inserted': 4, 'skipped': 0}
+[新配对补齐 v3 -> 应可用] version=3 N1(g=E1001/r=E1002) g-r=0.7000  N2 g-r=0.4500  Δ=-0.2500
+conflict batch: 整批退回；已入库星等保持: 20.1
 ```
 
-G01 keeps the night through its spare pair; G02 and G03 lose it and become
-待补测. Restoring the exposure restores all three pairings.
+## Live server (gunicorn, 2 workers x 2 threads, real HTTP + CSRF)
 
-## Live server (gunicorn, 2 workers x 2 threads)
+Started as the Dockerfile would run it (port 8080, `/data`-style DB dir):
 
-* `/healthz` -> 200, `/` -> 200.
-* Uploaded the sample CSV through the browser form (with CSRF token).
-* Fired two concurrent `POST /exposures/<id>/validity` requests for two
-  different exposures from separate clients. Both returned 200, both exposures
-  ended `valid=0`, and the affected coverage rows (G01/N2026-10-02, G02 and G03
-  on N2026-10-01) were all `unpaired` — i.e. both corrections are reflected.
+1. `/healthz` -> 200; form upload of `samples/survey_coverage.csv` with the
+   CSRF token -> `新增曝光 8 次，新增覆盖关系 12 条`.
+2. Uploaded `samples/photometry.csv` on `/grids/G01` -> `新增 7 行`.
+3. `GET /grids/G01?target=T001&first=N2026-10-01&second=N2026-10-02`:
+   version 1, N1 E1003/E1004 g−r 0.5000, N2 E1101/E1102 g−r 0.6000,
+   Δ = +0.1000.
+4. Uploaded `samples/photometry_complete_v2.csv` -> `新增 1 行，跳过同键同值 3 行`;
+   re-fetch -> version 2, g−r 0.7000 / 0.8500, Δ = +0.1500.
+5. `POST /exposures/3/validity valid=0` (E1003) with the comparison URL as
+   `next` -> `曝光 3 已改为已剔除`; re-fetch -> 暂不可比（找不到共同版号）,
+   because the night now pairs E1001/E1002.
+6. Uploaded `samples/photometry_alt_pair.csv` -> `新增 4 行`; re-fetch ->
+   version 3, E1001/E1002 g−r 0.7000, N2 g−r 0.4500, Δ = −0.2500.
+7. Restored E1003 -> comparison back to E1003/E1004 version 2, Δ = +0.1500.
+8. `samples/photometry_conflict.csv` -> `测光导入被拒绝，已入库的星等未改动` and
+   the DB still holds 20.1 (not 99.999). Live `nan` magnitude and version `0`
+   were rejected at parse time; an exposure not covering the grid was rejected
+   with `不存在或未覆盖网格 G02`.
 
-## Repair tool
+## Compose validation
 
-`scripts/repair_coverage.py --check` detected a hand-corrupted coverage row;
-`--db ... ` rebuilt it; a second `--check` reported `coverage cache OK`.
+* `docker-compose.yml` parsed and checked: service `coverage-review` builds `.`,
+  publishes `8080:8080`, sets `COVERAGE_DB=/data/coverage.sqlite3`, mounts the
+  named volume `coverage-data` at `/data`, injects `SECRET_KEY`.
+* `Dockerfile` uses the same command line exercised above (`gunicorn ... wsgi:app`),
+  a `/healthz` healthcheck, and a non-root `survey` user owning `/data`.
 
 ## Not verified here
 
-* `docker compose up` was not executed (no Docker daemon in this environment).
-  The Dockerfile/compose file were reviewed by hand: the app listens on 8080,
-  the DB lives on a named volume at `/data`, `SECRET_KEY` is injected from the
-  environment, and the container healthcheck hits `/healthz`.
+* `docker compose up --build` and volume persistence across container restarts
+  were not executed (no Docker daemon / container privileges in this sandbox).
+* No real login/audit actor separation (unchanged from the previous round).
+* Large photometry batches are still row-by-row (fine for the tens-of-thousands
+  scale); no bulk path yet.

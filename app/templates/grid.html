@@ -33,6 +33,104 @@
   </table>
 </section>
 
+<section class="panel" id="compare">
+  <h2>两晚颜色对比（g−r）</h2>
+  <p class="hint">
+    选一个目标和两个不同观测夜，按当前现行的 g/r 配对读取两晚星等。
+    两晚只在同一测光版号下可比：取四次曝光（两晚各一 g 一 r）星等都齐备的最高共同版号；
+    新版未齐时自动退回仍满足配对的旧版。
+  </p>
+  <form method="get" action="{{ url_for('grid_page', grid_id=grid.grid_id) }}" class="compare-form">
+    {% if grid.targets %}
+      <label>目标
+        <select name="target">
+          {% for t in grid.targets %}
+            <option value="{{ t }}" {% if comparison and comparison.target_id == t %}selected{% endif %}>{{ t }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>先选夜
+        <select name="first">
+          {% for n in grid.nights %}
+            <option value="{{ n.night }}" {% if comparison and comparison.first_night == n.night %}selected{% endif %}>{{ n.night }}{% if not n.usable %}（无配对）{% endif %}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>后选夜
+        <select name="second">
+          {% for n in grid.nights %}
+            <option value="{{ n.night }}" {% if comparison %}{% if comparison.second_night == n.night %}selected{% endif %}{% elif loop.index == 2 %}selected{% endif %}>{{ n.night }}{% if not n.usable %}（无配对）{% endif %}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">对比</button>
+    {% else %}
+      <span class="muted">本网格还没有测光数据，先在下方上传测光 CSV。</span>
+    {% endif %}
+  </form>
+
+  {% if comparison %}
+    {% if not comparison.available %}
+      <div class="flash flash-error">{{ comparison.reason }}</div>
+    {% else %}
+      <table class="grid-table compare-table">
+        <thead>
+          <tr>
+            <th>观测夜</th><th>g 曝光</th><th>r 曝光</th><th>测光版号</th>
+            <th>g 星等</th><th>r 星等</th><th>g−r</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for key, label in (("first", "先选夜"), ("second", "后选夜")) %}
+            {% set c = comparison[key] %}
+            <tr>
+              <td>{{ c.night }} <span class="muted">{{ label }}</span></td>
+              <td><code>{{ c.g_exposure_no }}</code></td>
+              <td><code>{{ c.r_exposure_no }}</code></td>
+              <td class="num">{{ comparison.version }}</td>
+              <td class="num">{{ "%.4f"|format(c.g_magnitude) }}</td>
+              <td class="num">{{ "%.4f"|format(c.r_magnitude) }}</td>
+              <td class="num">{{ "%.4f"|format(c.g_minus_r) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="delta">
+        色指数差（后选夜 − 先选夜）：
+        <b>Δ(g−r) = {{ "%+.4f"|format(comparison.colour_delta) }}</b>
+        <span class="muted">（{{ comparison.second_night }} − {{ comparison.first_night }}）</span>
+      </p>
+      <p class="hint">
+        结果取自当前入库数据与现行配对；若配对改为另一对曝光，或新一版测光到齐，
+        再次提交对比会重新判定。
+      </p>
+    {% endif %}
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>导入测光 CSV</h2>
+  <form method="post" action="{{ url_for('upload_photometry', grid_id=grid.grid_id) }}"
+        enctype="multipart/form-data" class="import-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="file" name="csv" accept=".csv,text/csv" required>
+    <button type="submit">导入测光</button>
+    <span class="hint">
+      列名：grid, target, night, exposure, version, magnitude（也接受「网格号,目标号,观测夜,曝光号,测光版号,星等」）。
+      星等须为有限数值，版号为正整数；前五列为键，同键同值只记一次。
+      曝光未覆盖本网格或同键星等不同，整批退回，已入库星等不变。
+    </span>
+  </form>
+  {% if grid.photometry_imports %}
+    <p class="hint">最近测光导入（全部网格）：</p>
+    <ul class="imports">
+      {% for imp in grid.photometry_imports %}
+        <li>{{ imp.imported_at }} &middot; {{ imp.filename }} &middot; 新增 {{ imp.inserted }} / 跳过 {{ imp.skipped }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+
 <section class="panel">
   <h2>本网格全部曝光</h2>
   <p class="hint">剔除或恢复一次曝光后，只重核它在当夜覆盖的网格配对；若原配对失效，会自动换用同夜另一对合格的 g/r。</p>
@@ -55,7 +153,11 @@
         <td>
           <form method="post" action="{{ url_for('toggle', exposure_id=e.id) }}" class="inline-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <input type="hidden" name="next" value="{{ url_for('grid_page', grid_id=grid.grid_id) }}">
+            {% if comparison %}
+              <input type="hidden" name="next" value="{{ url_for('grid_page', grid_id=grid.grid_id, target=comparison.target_id, first=comparison.first_night, second=comparison.second_night) }}">
+            {% else %}
+              <input type="hidden" name="next" value="{{ url_for('grid_page', grid_id=grid.grid_id) }}">
+            {% endif %}
             {% if e.valid %}
               <input type="hidden" name="valid" value="0">
               <button type="submit" class="danger">剔除</button>

@@ -67,18 +67,40 @@ G01,E1002,N2026-10-01,2026-10-01T12:10:00Z,r
 
 * `/` 总览：每格可用夜数、状态徽标、每夜配对的两个曝光号与相隔秒数。
 * `/grids/<网格号>` 单格详情：每夜配对结果、该格全部曝光（含覆盖的网格列表）、
-  剔除/恢复按钮、本格更正记录。
+  剔除/恢复按钮、本格更正记录。详情页另有「两晚颜色对比」入口和测光 CSV 上传。
 * `/api/grids` JSON（给分析脚本用）；`/healthz` 容器健康检查。
+
+## 两晚颜色对比（g−r）
+
+1. 在单格详情页上传测光 CSV，每行：网格、目标号、观测夜、曝光号、测光版号、星等。
+   * 星等必须是**有限数值**（`nan`/`inf`/非数字整行报错）；版号必须是**正整数**。
+   * 前五列是键；同一键同一数值只记一次（重复行不报错、不重复入库）。
+   * 同一键不同星等、曝光不存在或**未覆盖该网格** → 整批退回，已入库星等不变。
+   * 一次测光版号（round）在各观测夜、各波段共用；跨夜比较必须用同一版号。
+2. 选一个目标和两个不同观测夜，点「对比」。结果**只读当前已提交的数据**，并且
+   每次请求都在同一读快照里重新读取 `coverage`，所以重新比对总按现行配对判定。
+   * 取四次曝光（两晚各一 g、一 r）星等都齐备的**最高共同版号**；
+   * 新版没齐时自动退回仍满足配对的旧版；
+   * 列出两晚所用 g/r 曝光号、版号、两晚 g 星等减 r 星等，以及
+     **后选夜 − 先选夜** 的色指数差；
+   * 某夜没有现行 g/r 配对、或找不到共同版号时，提示「暂不可比」而不猜数。
+3. 在详情页剔除配对中的曝光后，配对可能换成另一对；重新对比会按新配对重新判定，
+   若新配对没有同版四行测光，就显示暂不可比。为新配对补测光后即可再次比较。
+
+样例：`samples/photometry.csv`（含完整 v1 与不完整的 v2，应回退到 v1）、
+`samples/photometry_complete_v2.csv`（补齐 v2 后应用 v2）、
+`samples/photometry_alt_pair.csv`（换配对后的 v3 数据）、
+`samples/photometry_conflict.csv`（同键不同值，会被退回）。
 
 ## 代码结构
 
 ```
-app/db.py          schema、配对算法、事务、重核、审计
-app/importer.py    CSV 解析与逐行校验
+app/db.py          schema、配对算法、事务、重核、审计、测光导入与对比
+app/importer.py    CSV 解析与逐行校验（曝光覆盖 + 测光）
 app/__init__.py    Flask 应用工厂与路由（CSRF 保护）
 app/templates/     Jinja 模板
-tests/             pytest（27 项）
-scripts/           verify_multi_grid_invalidation.py、repair_coverage.py
+tests/             pytest（63 项）
+scripts/           verify_multi_grid_invalidation.py、verify_colour_comparison.py、repair_coverage.py
 docs/verification.md  本次交付的验证记录
 ```
 
@@ -86,6 +108,7 @@ docs/verification.md  本次交付的验证记录
 
 ```bash
 python3 scripts/verify_multi_grid_invalidation.py        # 剔除影响多格的试跑（临时库）
+python3 scripts/verify_colour_comparison.py              # 两晚对比全流程试跑（临时库）
 python3 scripts/verify_multi_grid_invalidation.py --db ./data/coverage.sqlite3  # 在实库上跑（会改数据！）
 python3 scripts/repair_coverage.py --db ./data/coverage.sqlite3 --check   # 只读体检
 python3 scripts/repair_coverage.py --db ./data/coverage.sqlite3           # 从曝光表重建缓存
@@ -94,9 +117,10 @@ python3 -m pytest -q
 
 ## 遗留工作
 
-1. **Docker 未在本机实际启动验证**（环境无 Docker daemon）。compose/Dockerfile 已按
-   `8080`、`/data` 卷、健康检查写好，但需要在有 Docker 的机器上实跑一次
-   `docker compose up --build` 并确认卷持久化。
+1. **Docker 未在本机实际启动验证**（环境无 Docker daemon、无容器权限）。compose/
+   Dockerfile 已按 `8080`、`/data` 卷、健康检查写好并做了 YAML 结构校验，但需要在有
+   Docker 的机器上实跑一次 `docker compose up --build` 并确认卷持久化。本轮功能已用
+   gunicorn 以同样命令行在真实 HTTP 上完整走通（见 `docs/verification.md`）。
 2. **身份与权限**：目前只有一个隐含角色「数据员」，审计日志 actor 固定为
    `data-steward`。接入真实登录（及按人区分 actor）未做。
 3. **CSV 大批量性能**：导入逐行 `SELECT` + 受影响格全量重算，当前按万级行设计；

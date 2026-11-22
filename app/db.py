@@ -81,6 +81,36 @@ CREATE TABLE IF NOT EXISTS imports (
     skipped     INTEGER NOT NULL
 );
 
+-- One photometric measurement of one target in one exposure.
+--
+-- The first four columns plus ``version`` are the logical key: the same
+-- photometry *round* (version) is shared by every night and band, so a
+-- comparison may only combine g/r magnitudes carrying the same version.
+-- ``exposure_no`` is resolved to an exposure and must cover ``grid_id`` at
+-- import time.
+CREATE TABLE IF NOT EXISTS photometry (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    grid_id     TEXT    NOT NULL,
+    target_id   TEXT    NOT NULL,
+    night       TEXT    NOT NULL,
+    exposure_no TEXT    NOT NULL,
+    version     INTEGER NOT NULL CHECK (version > 0),
+    magnitude   REAL    NOT NULL,
+    imported_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (grid_id, target_id, night, exposure_no, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_photometry_lookup
+    ON photometry (grid_id, target_id, night, exposure_no);
+
+CREATE TABLE IF NOT EXISTS photometry_imports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename    TEXT    NOT NULL,
+    imported_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    inserted    INTEGER NOT NULL,
+    skipped     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -153,8 +183,33 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One consistent read snapshot, so coverage and photometry agree.
+
+    If the caller already owns a transaction this is a no-op and that
+    transaction's snapshot is reused.
+    """
+    owns = not conn.in_transaction
+    if owns:
+        conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        if owns:
+            conn.execute("ROLLBACK")
+        raise
+    else:
+        if owns:
+            conn.execute("COMMIT")
+
+
 class ImportConflict(ValueError):
     """A CSV row contradicts an already stored exposure."""
+
+
+class PhotometryConflict(ValueError):
+    """A photometry CSV batch contradicts stored photometry or coverage."""
 
 
 def parse_utc(raw: str) -> str:
@@ -489,5 +544,287 @@ def grid_detail(conn: sqlite3.Connection, grid_id: str) -> dict | None:
                     (grid_id,),
                 ).fetchall()
             ]
+            summary["targets"] = [
+                r["target_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT target_id FROM photometry WHERE grid_id=? "
+                    "ORDER BY target_id",
+                    (grid_id,),
+                ).fetchall()
+            ]
+            summary["photometry_imports"] = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM photometry_imports ORDER BY id DESC LIMIT 5"
+                ).fetchall()
+            ]
             return summary
     return None
+
+
+# ---------------------------------------------------------------------------
+# Photometry import
+# ---------------------------------------------------------------------------
+
+PHOTOMETRY_KEY = ("grid_id", "target_id", "night", "exposure_no", "version")
+
+
+def import_photometry(
+    conn: sqlite3.Connection, rows: Iterable[dict], filename: str
+) -> dict:
+    """Import photometry rows atomically.
+
+    The parser has already validated numbers and deduplicated identical rows.
+    Here every row is checked against the stored data:
+
+    * the ``(night, exposure_no)`` exposure must exist **and** cover the grid;
+    * a key already stored with the same value is skipped;
+    * a key already stored with a different value rejects the whole batch and
+      leaves every stored magnitude untouched.
+
+    Returns ``{"inserted": n, "skipped": n}``.
+    """
+    inserted = 0
+    skipped = 0
+    with transaction(conn):
+        for row in rows:
+            link = conn.execute(
+                "SELECT e.id FROM exposures e "
+                "JOIN exposure_grids eg ON eg.exposure_id = e.id "
+                "WHERE e.night = ? AND e.exposure_no = ? AND eg.grid_id = ?",
+                (row["night"], row["exposure_no"], row["grid_id"]),
+            ).fetchone()
+            if link is None:
+                raise PhotometryConflict(
+                    f"第 {row.get('line', '?')} 行：曝光 {row['night']}/{row['exposure_no']} "
+                    f"不存在或未覆盖网格 {row['grid_id']}"
+                )
+            existing = conn.execute(
+                "SELECT id, magnitude FROM photometry WHERE grid_id=? AND target_id=? "
+                "AND night=? AND exposure_no=? AND version=?",
+                (
+                    row["grid_id"],
+                    row["target_id"],
+                    row["night"],
+                    row["exposure_no"],
+                    row["version"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                if existing["magnitude"] != row["magnitude"]:
+                    raise PhotometryConflict(
+                        f"第 {row.get('line', '?')} 行：网格 {row['grid_id']} 目标 "
+                        f"{row['target_id']} {row['night']}/{row['exposure_no']} 版本 "
+                        f"{row['version']} 已入库星等 {existing['magnitude']!r}，"
+                        f"与本次 {row['magnitude']!r} 不同"
+                    )
+                skipped += 1
+                continue
+            conn.execute(
+                "INSERT INTO photometry "
+                "(grid_id, target_id, night, exposure_no, version, magnitude) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row["grid_id"],
+                    row["target_id"],
+                    row["night"],
+                    row["exposure_no"],
+                    row["version"],
+                    row["magnitude"],
+                ),
+            )
+            inserted += 1
+        conn.execute(
+            "INSERT INTO photometry_imports (filename, inserted, skipped) VALUES (?, ?, ?)",
+            (filename, inserted, skipped),
+        )
+        _audit(
+            conn,
+            "photometry_import",
+            detail=f"{filename}: inserted={inserted} skipped={skipped}",
+        )
+    return {"inserted": inserted, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Night-to-night colour comparison
+# ---------------------------------------------------------------------------
+
+
+def _current_pair(conn: sqlite3.Connection, grid_id: str, night: str) -> dict | None:
+    """The pairing currently on record, or ``None`` when the night is unusable."""
+    row = conn.execute(
+        "SELECT c.status, c.reason, "
+        " g.id AS g_id, g.exposure_no AS g_no, g.valid AS g_valid, "
+        " r.id AS r_id, r.exposure_no AS r_no, r.valid AS r_valid "
+        "FROM coverage c "
+        "LEFT JOIN exposures g ON g.id = c.g_exposure "
+        "LEFT JOIN exposures r ON r.id = c.r_exposure "
+        "WHERE c.grid_id=? AND c.night=?",
+        (grid_id, night),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] != "paired" or row["g_no"] is None or row["r_no"] is None:
+        return None
+    if not row["g_valid"] or not row["r_valid"]:
+        # A cached pair must never be used after one of its members was
+        # invalidated; recompute would have replaced it, but stay defensive.
+        return None
+    return {"g_no": row["g_no"], "r_no": row["r_no"]}
+
+
+def _versions_for_exposure(
+    conn: sqlite3.Connection,
+    grid_id: str,
+    target_id: str,
+    night: str,
+    exposure_no: str,
+) -> dict[int, float]:
+    return {
+        row["version"]: row["magnitude"]
+        for row in conn.execute(
+            "SELECT version, magnitude FROM photometry "
+            "WHERE grid_id=? AND target_id=? AND night=? AND exposure_no=?",
+            (grid_id, target_id, night, exposure_no),
+        ).fetchall()
+    }
+
+
+def _night_colour(
+    conn: sqlite3.Connection,
+    grid_id: str,
+    target_id: str,
+    night: str,
+    pair: dict,
+    version: int,
+) -> dict | None:
+    g_mags = _versions_for_exposure(conn, grid_id, target_id, night, pair["g_no"])
+    r_mags = _versions_for_exposure(conn, grid_id, target_id, night, pair["r_no"])
+    if version not in g_mags or version not in r_mags:
+        return None
+    g_mag = g_mags[version]
+    r_mag = r_mags[version]
+    return {
+        "night": night,
+        "g_exposure_no": pair["g_no"],
+        "r_exposure_no": pair["r_no"],
+        "g_magnitude": g_mag,
+        "r_magnitude": r_mag,
+        "g_minus_r": g_mag - r_mag,
+    }
+
+
+def compare_colour(
+    conn: sqlite3.Connection,
+    grid_id: str,
+    target_id: str,
+    first_night: str,
+    second_night: str,
+) -> dict:
+    """Compare one target's g−r on two nights using the current pairings.
+
+    Both nights are read from one snapshot.  A photometry *version* is one
+    round shared by every night and band, so the two nights are only
+    comparable when the same version has all four magnitudes (g and r on each
+    night) for the exposures currently paired.  The highest such version wins;
+    when a newer round is still incomplete the newest complete older round is
+    used.  Fetching always re-reads coverage, so switching the pair re-runs the
+    version choice.
+
+    Returns a dict with ``available`` False and a Chinese ``reason`` when the
+    pair is missing or no shared version is complete.
+    """
+    result = {
+        "grid_id": grid_id,
+        "target_id": target_id,
+        "first_night": first_night,
+        "second_night": second_night,
+        "available": False,
+        "reason": None,
+        "version": None,
+        "first": None,
+        "second": None,
+        "colour_delta": None,
+    }
+    if not target_id:
+        result["reason"] = "请选择一个目标号"
+        return result
+    if not first_night or not second_night:
+        result["reason"] = "请选择两个观测夜"
+        return result
+    if first_night == second_night:
+        result["reason"] = "两个观测夜必须不同，暂不可比"
+        return result
+
+    with read_snapshot(conn):
+        # A pair is only defined for a night this grid actually has exposure
+        # coverage on; anything else is a bad request rather than "not comparable".
+        known = {
+            row["night"]
+            for row in conn.execute(
+                "SELECT DISTINCT e.night FROM exposures e "
+                "JOIN exposure_grids eg ON eg.exposure_id = e.id "
+                "WHERE eg.grid_id=?",
+                (grid_id,),
+            ).fetchall()
+        }
+        unknown = [n for n in (first_night, second_night) if n not in known]
+        if unknown:
+            result["reason"] = f"{'、'.join(unknown)} 不在本网格的观测夜内，暂不可比"
+            return result
+
+        has_target = conn.execute(
+            "SELECT 1 FROM photometry WHERE grid_id=? AND target_id=? LIMIT 1",
+            (grid_id, target_id),
+        ).fetchone()
+        if has_target is None:
+            result["reason"] = f"本网格没有目标 {target_id} 的测光数据，暂不可比"
+            return result
+
+        first_pair = _current_pair(conn, grid_id, first_night)
+        second_pair = _current_pair(conn, grid_id, second_night)
+        if first_pair is None or second_pair is None:
+            missing = [
+                night
+                for night, pair in ((first_night, first_pair), (second_night, second_pair))
+                if pair is None
+            ]
+            result["reason"] = (
+                f"{'、'.join(missing)} 没有现行的 g/r 配对，暂不可比"
+            )
+            return result
+
+        first_versions = set(
+            _versions_for_exposure(conn, grid_id, target_id, first_night, first_pair["g_no"])
+        ) & set(
+            _versions_for_exposure(conn, grid_id, target_id, first_night, first_pair["r_no"])
+        )
+        second_versions = set(
+            _versions_for_exposure(conn, grid_id, target_id, second_night, second_pair["g_no"])
+        ) & set(
+            _versions_for_exposure(conn, grid_id, target_id, second_night, second_pair["r_no"])
+        )
+        common = first_versions & second_versions
+        if not common:
+            result["reason"] = "找不到可用共同版号（四次曝光的星等不齐），暂不可比"
+            return result
+
+        # Highest shared version whose four magnitudes are all present.
+        version = max(common)
+        first = _night_colour(conn, grid_id, target_id, first_night, first_pair, version)
+        second = _night_colour(conn, grid_id, target_id, second_night, second_pair, version)
+        if first is None or second is None:
+            result["reason"] = "找不到可用共同版号（四次曝光的星等不齐），暂不可比"
+            return result
+
+        result.update(
+            {
+                "available": True,
+                "version": version,
+                "first": first,
+                "second": second,
+                "colour_delta": second["g_minus_r"] - first["g_minus_r"],
+            }
+        )
+        return result
