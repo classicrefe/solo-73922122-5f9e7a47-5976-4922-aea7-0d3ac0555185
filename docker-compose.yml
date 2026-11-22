@@ -1,0 +1,16 @@
+services:
+  coverage-review:
+    build: .
+    image: survey-coverage-review:latest
+    ports:
+      - "8080:8080"
+    environment:
+      # Change this before any shared deployment; it signs the CSRF session cookie.
+      SECRET_KEY: "${SECRET_KEY:-local-dev-secret-change-me}"
+      COVERAGE_DB: "/data/coverage.sqlite3"
+    volumes:
+      - coverage-data:/data
+    restart: unless-stopped
+
+volumes:
+  coverage-data:

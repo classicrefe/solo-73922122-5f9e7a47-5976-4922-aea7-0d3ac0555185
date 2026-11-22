@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <h2>导入曝光覆盖 CSV</h2>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="import-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="file" name="csv" accept=".csv,text/csv" required>
+    <button type="submit">导入</button>
+    <span class="hint">列名：grid, exposure, night, utc, band（也接受中文表头）。同一「观测夜 + 曝光号」可覆盖多个网格；完全重复的行会被跳过。</span>
+  </form>
+  {% if stats.imports %}
+    <ul class="imports">
+      {% for imp in stats.imports %}
+        <li>{{ imp.imported_at }} &middot; {{ imp.filename }} &middot; 新曝光 {{ imp.inserted }} / 新覆盖 {{ imp.linked }} / 跳过 {{ imp.skipped }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+
+<section class="stats">
+  <div class="stat"><b>{{ stats.grids }}</b><span>网格</span></div>
+  <div class="stat"><b>{{ stats.usable_nights }}</b><span>可用观测夜（合计）</span></div>
+  <div class="stat {% if stats.needs_more %}warn{% endif %}"><b>{{ stats.needs_more }}</b><span>待补测网格（&lt; 2 夜）</span></div>
+</section>
+
+<section class="panel">
+  <h2>网格覆盖一览</h2>
+  {% if not grids %}
+    <p class="empty">还没有数据，先导入一份 CSV。</p>
+  {% else %}
+  <table class="grid-table">
+    <thead>
+      <tr>
+        <th>网格</th>
+        <th>可用夜数</th>
+        <th>状态</th>
+        <th>每夜配对（g / r 曝光号，相隔秒数）</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for g in grids %}
+      <tr class="{% if g.needs_more %}row-warn{% endif %}">
+        <td><a href="{{ url_for('grid_page', grid_id=g.grid_id) }}">{{ g.grid_id }}</a></td>
+        <td class="num">{{ g.usable_nights }}</td>
+        <td>
+          {% if g.needs_more %}<span class="badge badge-warn">待补测</span>
+          {% else %}<span class="badge badge-ok">可分析</span>{% endif %}
+        </td>
+        <td>
+          <ul class="night-list">
+            {% for n in g.nights %}
+              <li class="{% if n.usable %}night-ok{% else %}night-bad{% endif %}">
+                <span class="night">{{ n.night }}</span>
+                {% if n.usable %}
+                  <code>{{ n.g_no }}</code> / <code>{{ n.r_no }}</code>
+                  <span class="muted">{{ n.seconds }} s</span>
+                {% else %}
+                  <span class="muted">不可用：{{ n.reason }}</span>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

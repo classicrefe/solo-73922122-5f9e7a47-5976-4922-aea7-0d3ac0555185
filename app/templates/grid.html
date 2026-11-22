@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}网格 {{ grid.grid_id }} &middot; 巡天颜色变化核查{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('index') }}">&larr; 返回总览</a></p>
+
+<section class="panel">
+  <h2>网格 {{ grid.grid_id }}</h2>
+  <p>
+    可用夜数 <b>{{ grid.usable_nights }}</b>
+    {% if grid.needs_more %}
+      <span class="badge badge-warn">待补测（少于两夜）</span>
+    {% else %}
+      <span class="badge badge-ok">满足至少两晚</span>
+    {% endif %}
+  </p>
+
+  <table class="grid-table">
+    <thead>
+      <tr><th>观测夜</th><th>配对结果</th><th>g 曝光</th><th>r 曝光</th><th>相隔</th></tr>
+    </thead>
+    <tbody>
+      {% for n in grid.nights %}
+      <tr class="{% if n.usable %}night-ok{% else %}night-bad{% endif %}">
+        <td>{{ n.night }}</td>
+        <td>{% if n.usable %}<span class="badge badge-ok">可用</span>{% else %}<span class="badge badge-warn">不可用</span>{% endif %}
+          {% if n.reason %}<span class="muted">{{ n.reason }}</span>{% endif %}</td>
+        <td>{% if n.g_exposure %}<code>{{ n.g_no }}</code><br><span class="muted">{{ n.g_time }}</span>{% else %}—{% endif %}</td>
+        <td>{% if n.r_exposure %}<code>{{ n.r_no }}</code><br><span class="muted">{{ n.r_time }}</span>{% else %}—{% endif %}</td>
+        <td class="num">{% if n.seconds is not none %}{{ n.seconds }} s{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>本网格全部曝光</h2>
+  <p class="hint">剔除或恢复一次曝光后，只重核它在当夜覆盖的网格配对；若原配对失效，会自动换用同夜另一对合格的 g/r。</p>
+  <table class="grid-table">
+    <thead>
+      <tr><th>观测夜</th><th>曝光号</th><th>波段</th><th>UTC 时刻</th><th>覆盖网格</th><th>状态</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for e in grid.exposures %}
+      <tr class="{% if not e.valid %}row-invalid{% endif %}">
+        <td>{{ e.night }}</td>
+        <td><code>{{ e.exposure_no }}</code></td>
+        <td class="band-{{ e.band }}">{{ e.band }}</td>
+        <td>{{ e.utc_time }}</td>
+        <td class="muted">{{ e.grids }}</td>
+        <td>
+          {% if e.valid %}<span class="badge badge-ok">有效</span>
+          {% else %}<span class="badge badge-bad">已剔除</span>{% endif %}
+        </td>
+        <td>
+          <form method="post" action="{{ url_for('toggle', exposure_id=e.id) }}" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ url_for('grid_page', grid_id=grid.grid_id) }}">
+            {% if e.valid %}
+              <input type="hidden" name="valid" value="0">
+              <button type="submit" class="danger">剔除</button>
+            {% else %}
+              <input type="hidden" name="valid" value="1">
+              <button type="submit">恢复</button>
+            {% endif %}
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if grid.audit %}
+<section class="panel">
+  <h2>本网格更正记录</h2>
+  <ul class="imports">
+    {% for a in grid.audit %}
+      <li>{{ a.at }} &middot; {{ a.action }} &middot; 曝光 {{ a.exposure_id or '—' }} &middot; {{ a.night or '—' }} &middot; {{ a.detail or '' }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
